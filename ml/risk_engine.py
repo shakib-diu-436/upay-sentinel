@@ -7,6 +7,10 @@ import joblib
 import pandas as pd
 
 
+# ============================================================
+# PATH CONFIGURATION
+# ============================================================
+
 ROOT = Path(__file__).resolve().parents[1]
 
 DATA_PATH = (
@@ -29,8 +33,12 @@ ANOMALY_MODEL_PATH = (
 )
 
 
+# ============================================================
+# DATA LOADING
+# ============================================================
+
 def load_transaction_data() -> pd.DataFrame:
-    """Load synthetic transaction dataset."""
+    """Load the synthetic transaction dataset."""
 
     if not DATA_PATH.exists():
         raise FileNotFoundError(
@@ -41,8 +49,12 @@ def load_transaction_data() -> pd.DataFrame:
     return pd.read_csv(DATA_PATH)
 
 
+# ============================================================
+# MODEL LOADING
+# ============================================================
+
 def load_risk_model():
-    """Load supervised transaction risk model."""
+    """Load the trained supervised transaction risk model."""
 
     if not RISK_MODEL_PATH.exists():
         raise FileNotFoundError(
@@ -65,7 +77,7 @@ def load_risk_model():
 
 
 def load_anomaly_model():
-    """Load behavioral anomaly model."""
+    """Load the trained behavioral anomaly model."""
 
     if not ANOMALY_MODEL_PATH.exists():
         raise FileNotFoundError(
@@ -86,17 +98,20 @@ def load_anomaly_model():
     )
 
 
+# ============================================================
+# TRANSACTION SELECTION
+# ============================================================
+
 def get_transaction(
     df: pd.DataFrame,
 ) -> pd.Series:
     """
-    Select transaction by ID.
+    Select a transaction by ID.
 
     Usage:
         python ml/risk_engine.py TX001758
 
-    Without ID, TX001758-like random selection is avoided;
-    instead a deterministic sample is used.
+    Without a transaction ID, a deterministic sample is used.
     """
 
     if len(sys.argv) > 1:
@@ -121,12 +136,18 @@ def get_transaction(
     ).iloc[0]
 
 
+# ============================================================
+# TRANSACTION RISK
+# ============================================================
+
 def calculate_transaction_risk(
     model,
     features: list[str],
     transaction: pd.Series,
 ) -> float:
-    """Return transaction risk as 0-100."""
+    """
+    Calculate transaction risk score from 0 to 100.
+    """
 
     X = pd.DataFrame(
         [
@@ -144,16 +165,20 @@ def calculate_transaction_risk(
     return probability * 100.0
 
 
+# ============================================================
+# BEHAVIORAL ANOMALY
+# ============================================================
+
 def calculate_behavior_anomaly(
     model,
     features: list[str],
     transaction: pd.Series,
 ) -> float:
     """
-    Convert Isolation Forest output to a simple
-    0-100 anomaly display score.
+    Convert Isolation Forest output into a 0-100
+    behavioral anomaly severity score.
 
-    Important:
+    IMPORTANT:
     This is an anomaly severity score, not a probability
     of fraud.
     """
@@ -171,8 +196,8 @@ def calculate_behavior_anomaly(
         model.decision_function(X)[0]
     )
 
-    # Convert Isolation Forest's decision score
-    # into a human-readable anomaly severity.
+    # Convert Isolation Forest decision score to
+    # a bounded human-readable severity score.
     anomaly_score = 0.5 - raw_score
 
     anomaly_score = max(
@@ -186,26 +211,76 @@ def calculate_behavior_anomaly(
     return anomaly_score * 100.0
 
 
+# ============================================================
+# RISK FUSION
+# ============================================================
+
 def calculate_fused_risk(
     transaction_risk: float,
     anomaly_score: float,
 ) -> float:
     """
-    Combine the two AI signals.
+    Combine transaction risk and behavioral anomaly
+    into a composite Sentinel risk severity score.
 
-    Current prototype weighting:
+    Base contribution:
         70% transaction risk
         30% behavioral anomaly
 
-    These weights are intentionally transparent
-    and should later be validated/tuned using
-    held-out data.
+    Corroboration bonus:
+        When BOTH signals are high, the agreement between
+        the two models increases the final risk score.
+
+    IMPORTANT:
+        This is a composite risk severity score.
+        It is NOT a calibrated probability of fraud.
     """
 
-    fused_score = (
-        0.70 * transaction_risk
-        + 0.30 * anomaly_score
+    # --------------------------------------------------------
+    # Normalize both scores
+    # --------------------------------------------------------
+
+    transaction = max(
+        0.0,
+        min(100.0, transaction_risk),
+    ) / 100.0
+
+    anomaly = max(
+        0.0,
+        min(100.0, anomaly_score),
+    ) / 100.0
+
+    # --------------------------------------------------------
+    # Base fusion
+    # --------------------------------------------------------
+
+    base_risk = (
+        0.70 * transaction
+        + 0.30 * anomaly
     )
+
+    # --------------------------------------------------------
+    # Multi-signal corroboration
+    #
+    # If both models agree that a transaction is risky,
+    # the combined score receives an additional bounded
+    # contribution.
+    # --------------------------------------------------------
+
+    corroboration_bonus = (
+        0.15
+        * transaction
+        * anomaly
+    )
+
+    # --------------------------------------------------------
+    # Final score
+    # --------------------------------------------------------
+
+    fused_score = (
+        base_risk
+        + corroboration_bonus
+    ) * 100.0
 
     return max(
         0.0,
@@ -216,10 +291,20 @@ def calculate_fused_risk(
     )
 
 
+# ============================================================
+# RISK LEVEL
+# ============================================================
+
 def classify_risk(
     final_score: float,
 ) -> str:
-    """Convert final score into Sentinel risk level."""
+    """
+    Convert final composite score into a Sentinel level.
+
+        0 - 44.99   LOW RISK
+        45 - 69.99  REVIEW
+        70 - 100    HIGH RISK
+    """
 
     if final_score >= 70:
         return "HIGH RISK"
@@ -230,30 +315,41 @@ def classify_risk(
     return "LOW RISK"
 
 
+# ============================================================
+# RECOMMENDED ACTION
+# ============================================================
+
 def recommended_action(
     risk_level: str,
 ) -> str:
     """
-    Recommend a human-controlled action.
+    Provide a human-controlled operational recommendation.
 
-    The prototype does not autonomously block
-    or approve consequential financial activity.
+    The system does not autonomously block or approve
+    consequential financial transactions.
     """
 
     if risk_level == "HIGH RISK":
         return (
-            "Manual review and additional verification recommended."
+            "Manual review and additional verification "
+            "recommended."
         )
 
     if risk_level == "REVIEW":
         return (
-            "Review transaction context before proceeding."
+            "Review transaction context and supporting "
+            "signals before proceeding."
         )
 
     return (
-        "No elevated risk detected. Proceed normally."
+        "No elevated risk detected; continue according "
+        "to normal transaction controls."
     )
 
+
+# ============================================================
+# MAIN
+# ============================================================
 
 def main() -> None:
 
@@ -262,9 +358,9 @@ def main() -> None:
     print("                 AI RISK FUSION ENGINE")
     print("=" * 70)
 
-    # ---------------------------------------------------------
-    # Load
-    # ---------------------------------------------------------
+    # --------------------------------------------------------
+    # Load data and models
+    # --------------------------------------------------------
 
     df = load_transaction_data()
 
@@ -281,9 +377,9 @@ def main() -> None:
 
     transaction = get_transaction(df)
 
-    # ---------------------------------------------------------
+    # --------------------------------------------------------
     # AI #1 — Transaction Risk
-    # ---------------------------------------------------------
+    # --------------------------------------------------------
 
     transaction_risk = calculate_transaction_risk(
         risk_model,
@@ -291,9 +387,9 @@ def main() -> None:
         transaction,
     )
 
-    # ---------------------------------------------------------
+    # --------------------------------------------------------
     # AI #2 — Behavioral Anomaly
-    # ---------------------------------------------------------
+    # --------------------------------------------------------
 
     anomaly_score = calculate_behavior_anomaly(
         anomaly_model,
@@ -301,9 +397,9 @@ def main() -> None:
         transaction,
     )
 
-    # ---------------------------------------------------------
+    # --------------------------------------------------------
     # Fusion
-    # ---------------------------------------------------------
+    # --------------------------------------------------------
 
     final_risk = calculate_fused_risk(
         transaction_risk,
@@ -318,9 +414,9 @@ def main() -> None:
         final_level
     )
 
-    # ---------------------------------------------------------
-    # Display transaction
-    # ---------------------------------------------------------
+    # --------------------------------------------------------
+    # Transaction details
+    # --------------------------------------------------------
 
     print("\nTRANSACTION")
     print("-" * 70)
@@ -350,9 +446,9 @@ def main() -> None:
         f"{transaction['timestamp']}"
     )
 
-    # ---------------------------------------------------------
-    # AI signal results
-    # ---------------------------------------------------------
+    # --------------------------------------------------------
+    # AI Signals
+    # --------------------------------------------------------
 
     print("\nAI SIGNALS")
     print("-" * 70)
@@ -372,9 +468,9 @@ def main() -> None:
         f"{risk_threshold * 100:.2f}"
     )
 
-    # ---------------------------------------------------------
-    # Final fusion
-    # ---------------------------------------------------------
+    # --------------------------------------------------------
+    # Final Sentinel Decision
+    # --------------------------------------------------------
 
     print("\nSENTINEL DECISION")
     print("-" * 70)
@@ -394,21 +490,26 @@ def main() -> None:
         f"{action}"
     )
 
-    # ---------------------------------------------------------
-    # Explain supporting signals
-    # ---------------------------------------------------------
+    # --------------------------------------------------------
+    # Supporting Signals
+    # --------------------------------------------------------
 
     print("\nSUPPORTING SIGNALS")
     print("-" * 70)
 
+    signal_count = 0
+
     if int(transaction["recipient_new"]) == 1:
         print("• New recipient")
+        signal_count += 1
 
     if int(transaction["device_changed"]) == 1:
         print("• Device changed")
+        signal_count += 1
 
     if int(transaction["location_changed"]) == 1:
         print("• Location changed")
+        signal_count += 1
 
     if float(transaction["amount_ratio"]) >= 3:
         print(
@@ -416,6 +517,7 @@ def main() -> None:
             f"{float(transaction['amount_ratio']):.2f}× "
             f"the customer's typical amount"
         )
+        signal_count += 1
 
     if int(transaction["transactions_last_1h"]) >= 3:
         print(
@@ -423,6 +525,7 @@ def main() -> None:
             f"{int(transaction['transactions_last_1h'])} "
             f"transactions in the last hour"
         )
+        signal_count += 1
 
     if float(
         transaction["behavioral_deviation_score"]
@@ -430,15 +533,28 @@ def main() -> None:
         print(
             "• Significant behavioral deviation"
         )
+        signal_count += 1
 
-    # ---------------------------------------------------------
-    # Synthetic ground truth
-    # ---------------------------------------------------------
+    if signal_count == 0:
+        print(
+            "• No major predefined risk signals detected"
+        )
+
+    # --------------------------------------------------------
+    # Synthetic Ground Truth
+    #
+    # This section exists ONLY for development/testing.
+    # It must not be shown to end users in a real system.
+    # --------------------------------------------------------
 
     if "is_suspicious" in transaction.index:
 
         actual = int(
             transaction["is_suspicious"]
+        )
+
+        predicted_suspicious = (
+            final_level == "HIGH RISK"
         )
 
         print("\nSYNTHETIC DATA CHECK")
@@ -451,7 +567,12 @@ def main() -> None:
 
         print(
             f"Fusion Result: "
-            f"{'SUSPICIOUS' if final_level == 'HIGH RISK' else 'NORMAL/REVIEW'}"
+            f"{'SUSPICIOUS' if predicted_suspicious else final_level}"
+        )
+
+        print(
+            f"Prediction Match: "
+            f"{'YES' if actual == int(predicted_suspicious) else 'NO'}"
         )
 
     print("\n" + "=" * 70)
