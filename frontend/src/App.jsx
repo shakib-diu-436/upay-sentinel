@@ -151,6 +151,8 @@ function App() {
 
   const [error, setError] = useState('')
 
+  const [casesLoading, setCasesLoading] = useState(false)
+
   // ==========================================================
   // RISK CSS CLASS
   // ==========================================================
@@ -158,6 +160,83 @@ function App() {
   const riskClass = useMemo(() => {
     return getRiskClass(result?.risk_level)
   }, [result])
+
+  // ==========================================================
+  // LOAD RECENT CASES FROM DATABASE
+  // ==========================================================
+
+  async function loadRecentCases() {
+    setCasesLoading(true)
+
+    try {
+      const response = await fetch(CASES_URL)
+
+      const data = await response.json()
+
+      if (!response.ok) {
+        throw new Error(
+          data.detail || 'Could not load recent cases.',
+        )
+      }
+
+      // Backend may return:
+      // { cases: [...] }
+      // or directly [...]
+      const rawCases = Array.isArray(data)
+        ? data
+        : data.cases || data.results || []
+
+      const normalizedCases = rawCases.map((item) => ({
+        ...item,
+
+        // Support multiple possible backend field names.
+        amount:
+          item.amount ??
+          item.transaction_amount ??
+          item.raw_transaction?.amount ??
+          0,
+
+        customer_id:
+          item.customer_id ??
+          item.raw_transaction?.customer_id ??
+          '—',
+
+        recipient_id:
+          item.recipient_id ??
+          item.raw_transaction?.recipient_id ??
+          '—',
+
+        timestamp:
+          item.timestamp ??
+          item.transaction_timestamp ??
+          item.raw_transaction?.timestamp ??
+          null,
+
+        analyzedAt:
+          item.created_at ??
+          item.updated_at ??
+          item.analyzedAt ??
+          null,
+      }))
+
+      setCases(normalizedCases.slice(0, 10))
+    } catch (err) {
+      console.error(
+        'Failed to load recent cases:',
+        err,
+      )
+    } finally {
+      setCasesLoading(false)
+    }
+  }
+
+  // ==========================================================
+  // LOAD CASES WHEN APP STARTS / REFRESHES
+  // ==========================================================
+
+  useEffect(() => {
+    loadRecentCases()
+  }, [])
 
   // ==========================================================
   // UPDATE FORM
@@ -185,6 +264,61 @@ function App() {
   }
 
   // ==========================================================
+  // OPEN EXISTING CASE
+  // ==========================================================
+
+  async function openCase(item) {
+    setError('')
+
+    // If backend does not provide a case_id,
+    // use the list item directly.
+    if (!item.case_id) {
+      setResult(item)
+      return
+    }
+
+    try {
+      const response = await fetch(
+        `http://127.0.0.1:8000/api/v1/cases/${encodeURIComponent(
+          item.case_id,
+        )}`,
+      )
+
+      const data = await response.json()
+
+      if (!response.ok) {
+        throw new Error(
+          data.detail || 'Could not load case.',
+        )
+      }
+
+      // Support:
+      // { case: {...} }
+      // or directly {...}
+      const fullCase = data.case || data
+
+      setResult({
+        ...item,
+        ...fullCase,
+
+        amount:
+          fullCase.amount ??
+          item.amount ??
+          fullCase.transaction_amount ??
+          0,
+      })
+    } catch (err) {
+      // Fall back to the list record.
+      console.error(
+        'Could not open full case:',
+        err,
+      )
+
+      setResult(item)
+    }
+  }
+
+  // ==========================================================
   // ANALYZE TRANSACTION
   // ==========================================================
 
@@ -206,49 +340,57 @@ function App() {
         },
 
         body: JSON.stringify({
-          transaction_id: form.transaction_id,
+          transaction_id:
+            form.transaction_id,
 
-          customer_id: form.customer_id,
+          customer_id:
+            form.customer_id,
 
-          recipient_id: form.recipient_id,
+          recipient_id:
+            form.recipient_id,
 
-          timestamp: form.timestamp,
+          timestamp:
+            form.timestamp,
 
-          amount: Number(form.amount),
+          amount:
+            Number(form.amount),
 
-          recipient_new: Number(
-            form.recipient_new,
-          ),
+          recipient_new:
+            Number(form.recipient_new),
 
-          device_changed: Number(
-            form.device_changed,
-          ),
+          device_changed:
+            Number(form.device_changed),
 
-          location_changed: Number(
-            form.location_changed,
-          ),
+          location_changed:
+            Number(form.location_changed),
 
-          transactions_last_1h: Number(
-            form.transactions_last_1h,
-          ),
+          transactions_last_1h:
+            Number(
+              form.transactions_last_1h,
+            ),
 
-          transactions_last_24h: Number(
-            form.transactions_last_24h,
-          ),
+          transactions_last_24h:
+            Number(
+              form.transactions_last_24h,
+            ),
 
-          avg_amount_30d: Number(
-            form.avg_amount_30d,
-          ),
+          avg_amount_30d:
+            Number(
+              form.avg_amount_30d,
+            ),
 
-          usual_transaction_hour: Number(
-            form.usual_transaction_hour,
-          ),
+          usual_transaction_hour:
+            Number(
+              form.usual_transaction_hour,
+            ),
 
-          hour: Number(form.hour),
+          hour:
+            Number(form.hour),
 
-          account_age_days: Number(
-            form.account_age_days,
-          ),
+          account_age_days:
+            Number(
+              form.account_age_days,
+            ),
         }),
       })
 
@@ -256,19 +398,33 @@ function App() {
 
       if (!response.ok) {
         throw new Error(
-          data.detail || 'API request failed.',
+          data.detail ||
+            'API request failed.',
         )
       }
 
       // ------------------------------------------------------
-      // Keep amount with the case because the API response
-      // does not currently return the transaction amount.
+      // Keep amount because the investigation API response
+      // may not currently return the transaction amount.
       // ------------------------------------------------------
 
       const newCase = {
         ...data,
 
-        amount: Number(form.amount),
+        amount:
+          Number(form.amount),
+
+        customer_id:
+          data.customer_id ??
+          form.customer_id,
+
+        recipient_id:
+          data.recipient_id ??
+          form.recipient_id,
+
+        timestamp:
+          data.timestamp ??
+          form.timestamp,
 
         analyzedAt:
           new Date().toISOString(),
@@ -277,10 +433,7 @@ function App() {
       setResult(newCase)
 
       // ------------------------------------------------------
-      // Add case to investigation history.
-      // Existing transaction ID is replaced instead of
-      // creating duplicate entries.
-      // Maximum 10 recent cases.
+      // Immediately update visible case list.
       // ------------------------------------------------------
 
       setCases((current) => [
@@ -292,6 +445,14 @@ function App() {
             data.transaction_id,
         ),
       ].slice(0, 10))
+
+      // ------------------------------------------------------
+      // IMPORTANT:
+      // Reload from SQLite database so the frontend state
+      // exactly matches the persistent backend state.
+      // ------------------------------------------------------
+
+      await loadRecentCases()
     } catch (err) {
       setError(
         `${err.message} Make sure FastAPI is running on http://127.0.0.1:8000.`,
@@ -412,7 +573,9 @@ function App() {
 
                 <input
                   type="text"
-                  value={form.transaction_id}
+                  value={
+                    form.transaction_id
+                  }
                   onChange={(e) =>
                     update(
                       'transaction_id',
@@ -430,7 +593,9 @@ function App() {
 
                 <input
                   type="text"
-                  value={form.customer_id}
+                  value={
+                    form.customer_id
+                  }
                   onChange={(e) =>
                     update(
                       'customer_id',
@@ -448,7 +613,9 @@ function App() {
 
                 <input
                   type="text"
-                  value={form.recipient_id}
+                  value={
+                    form.recipient_id
+                  }
                   onChange={(e) =>
                     update(
                       'recipient_id',
@@ -462,12 +629,19 @@ function App() {
 
               {/* Timestamp */}
 
-              <Field label="Transaction Timestamp">
+              <Field
+                label="Transaction Timestamp"
+              >
 
                 <input
                   type="datetime-local"
                   value={
-                    form.timestamp.slice(0, 16)
+                    form.timestamp
+                      ? form.timestamp.slice(
+                          0,
+                          16,
+                        )
+                      : ''
                   }
                   onChange={(e) =>
                     update(
@@ -491,7 +665,9 @@ function App() {
                   type="number"
                   step="0.01"
                   min="0.01"
-                  value={form.amount}
+                  value={
+                    form.amount
+                  }
                   onChange={(e) =>
                     update(
                       'amount',
@@ -608,7 +784,9 @@ function App() {
                   type="number"
                   min="0"
                   max="23"
-                  value={form.hour}
+                  value={
+                    form.hour
+                  }
                   onChange={(e) =>
                     update(
                       'hour',
@@ -994,7 +1172,6 @@ function App() {
 
                           <strong>
                             {index + 1}.{' '}
-
                             {reason.label ||
                               prettyFeature(
                                 reason.feature,
@@ -1121,12 +1298,17 @@ function App() {
 
             <div className="case-count">
 
-              {cases.length}{' '}
-
-              CASE
-              {cases.length !== 1
-                ? 'S'
-                : ''}
+              {casesLoading
+                ? 'LOADING'
+                : (
+                  <>
+                    {cases.length}{' '}
+                    CASE
+                    {cases.length !== 1
+                      ? 'S'
+                      : ''}
+                  </>
+                )}
 
             </div>
 
@@ -1147,7 +1329,7 @@ function App() {
                   }`}
                   key={`${item.transaction_id}-${index}`}
                   onClick={() =>
-                    setResult(item)
+                    openCase(item)
                   }
                 >
 
