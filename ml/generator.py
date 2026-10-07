@@ -18,12 +18,17 @@ N_RECIPIENTS = 8000
 N_DEVICES = 6000
 N_LOCATIONS = 500
 
+N_TRANSACTIONS = 20000
+
 START_DATE = pd.Timestamp("2026-07-01")
 END_DATE = pd.Timestamp("2026-09-28 23:59:59")
 
+# Around 4% of transaction streams start an explicitly
+# suspicious behavioral scenario.
 INJECTION_PROB = 0.04
 
-RNG = np.random.default_rng(SEED)
+# Preserve approximately the original dataset prevalence.
+TARGET_SUSPICIOUS_RATE = 0.1077
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -54,17 +59,20 @@ def clip(
     )
 
 
-def sigmoid(value: float) -> float:
-    value = float(
-        np.clip(
-            value,
-            -30.0,
-            30.0,
-        )
+def sigmoid(
+    values,
+) -> np.ndarray:
+
+    values = np.asarray(values, dtype=float)
+
+    values = np.clip(
+        values,
+        -30.0,
+        30.0,
     )
 
-    return float(
-        1.0 / (1.0 + np.exp(-value))
+    return 1.0 / (
+        1.0 + np.exp(-values)
     )
 
 
@@ -74,7 +82,7 @@ def circular_hour_distance(
 ) -> int:
 
     difference = abs(
-        hour - usual_hour
+        int(hour) - int(usual_hour)
     )
 
     return int(
@@ -85,7 +93,7 @@ def circular_hour_distance(
     )
 
 
-def build_behavioral_deviation(
+def behavioral_deviation_score(
     amount_ratio: float,
     hour_distance: int,
     device_changed: int,
@@ -93,30 +101,72 @@ def build_behavioral_deviation(
     recipient_new: int,
 ) -> float:
 
+    score = (
+        0.40
+        * min(
+            amount_ratio / 8.0,
+            2.0,
+        )
+        + 0.20
+        * min(
+            hour_distance / 8.0,
+            2.0,
+        )
+        + 0.15
+        * device_changed
+        + 0.15
+        * location_changed
+        + 0.10
+        * recipient_new
+    )
+
     return float(
         np.clip(
-            (
-                0.40
-                * min(
-                    amount_ratio / 8.0,
-                    2.0,
-                )
-                + 0.20
-                * min(
-                    hour_distance / 8.0,
-                    2.0,
-                )
-                + 0.15
-                * device_changed
-                + 0.15
-                * location_changed
-                + 0.10
-                * recipient_new
-            ),
+            score,
             0.0,
             1.0,
         )
     )
+
+
+def calibrate_intercept(
+    raw_logits: np.ndarray,
+    target_rate: float,
+) -> float:
+    """
+    Find a constant intercept adjustment so that
+    mean(sigmoid(raw_logits + offset)) is approximately
+    equal to target_rate.
+
+    This controls class prevalence during synthetic-data
+    generation without using the target label itself.
+    """
+
+    low = -10.0
+    high = 10.0
+
+    for _ in range(80):
+
+        middle = (
+            low + high
+        ) / 2.0
+
+        probabilities = sigmoid(
+            raw_logits + middle
+        )
+
+        mean_probability = float(
+            probabilities.mean()
+        )
+
+        if mean_probability < target_rate:
+            low = middle
+        else:
+            high = middle
+
+    return (
+        low + high
+    ) / 2.0
 
 
 # ============================================================
@@ -124,7 +174,7 @@ def build_behavioral_deviation(
 # ============================================================
 
 def generate(
-    n: int = 20000,
+    n: int = N_TRANSACTIONS,
 ) -> pd.DataFrame:
     """
     Generate customer-centric synthetic mobile-wallet
@@ -132,19 +182,17 @@ def generate(
 
     Design goals:
 
-    1. Persistent customer behaviour.
+    1. Persistent customer profiles.
     2. Customer-specific recipient history.
-    3. Device and location changes relative to normal profile.
-    4. Transaction velocity calculated only from actual
-       previous transactions.
-    5. 30-day average amount calculated from actual previous
-       customer transactions when available.
-    6. A minority of transactions contain suspicious patterns.
-    7. Suspicious labels are generated only from observable
-       transaction and behavioural features.
-    8. No hidden injection flag is used by the label model.
-    9. Synthetic labels remain probabilistic rather than
-       deterministic.
+    3. Device/location changes relative to customer norms.
+    4. Actual historical transaction velocity.
+    5. Actual previous 30-day amount history.
+    6. Realistic customer transaction timing.
+    7. Explicit suspicious scenarios alter observable behavior.
+    8. No hidden injection variable is used in label generation.
+    9. Labels are probabilistic and noisy.
+    10. Nonlinear interactions create meaningful structure
+        for machine-learning models.
     """
 
     if n <= 0:
@@ -152,15 +200,20 @@ def generate(
             "n must be greater than 0"
         )
 
-    rng = np.random.default_rng(SEED)
+    rng = np.random.default_rng(
+        SEED
+    )
 
     # --------------------------------------------------------
-    # Customer profiles
+    # Customer count
     # --------------------------------------------------------
 
     customer_count = min(
         N_CUSTOMERS,
-        max(1, n // 5),
+        max(
+            1,
+            n // 5,
+        ),
     )
 
     customer_ids = np.arange(
@@ -168,16 +221,20 @@ def generate(
         customer_count + 1,
     )
 
+    # --------------------------------------------------------
+    # Persistent customer profiles
+    # --------------------------------------------------------
+
     customer_avg_amount = np.clip(
         np.exp(
             rng.normal(
-                np.log(850),
+                np.log(850.0),
                 0.55,
                 customer_count,
             )
         ),
-        80,
-        12000,
+        80.0,
+        12000.0,
     )
 
     customer_usual_hour = rng.integers(
@@ -186,22 +243,28 @@ def generate(
         customer_count,
     )
 
-    customer_home_location = rng.integers(
-        1,
-        N_LOCATIONS + 1,
-        customer_count,
+    customer_home_location = (
+        rng.integers(
+            1,
+            N_LOCATIONS + 1,
+            customer_count,
+        )
     )
 
-    customer_primary_device = rng.integers(
-        1,
-        N_DEVICES + 1,
-        customer_count,
+    customer_primary_device = (
+        rng.integers(
+            1,
+            N_DEVICES + 1,
+            customer_count,
+        )
     )
 
-    customer_account_age = rng.integers(
-        30,
-        2500,
-        customer_count,
+    customer_account_age = (
+        rng.integers(
+            30,
+            2500,
+            customer_count,
+        )
     )
 
     # --------------------------------------------------------
@@ -222,7 +285,7 @@ def generate(
             )
         )
 
-        recipients = rng.choice(
+        pool = rng.choice(
             np.arange(
                 1,
                 N_RECIPIENTS + 1,
@@ -233,14 +296,15 @@ def generate(
 
         recipient_pools[
             int(customer_num)
-        ] = set(
+        ] = {
             int(value)
-            for value in recipients
-        )
+            for value in pool
+        }
 
     # --------------------------------------------------------
-    # Give every customer at least one transaction.
-    # Remaining transactions are distributed randomly.
+    # Transaction counts per customer
+    #
+    # Ensure every customer has at least one transaction.
     # --------------------------------------------------------
 
     remaining = (
@@ -264,19 +328,23 @@ def generate(
     )
 
     # --------------------------------------------------------
-    # Generate rows customer by customer.
-    #
-    # This guarantees chronological history for each customer.
+    # Feature rows before labels
     # --------------------------------------------------------
 
     rows: list[dict] = []
+
+    # --------------------------------------------------------
+    # Generate per customer
+    # --------------------------------------------------------
 
     for customer_idx, count in enumerate(
         event_counts
     ):
 
         customer_num = int(
-            customer_ids[customer_idx]
+            customer_ids[
+                customer_idx
+            ]
         )
 
         base_amount = float(
@@ -310,97 +378,237 @@ def generate(
         )
 
         # ----------------------------------------------------
-        # Decide suspicious-pattern injections.
+        # Choose distinct days for normal transactions.
         #
-        # IMPORTANT:
-        # This flag affects observable behaviour only.
-        # It is never directly used in label generation.
+        # Distinct days make customer history chronological
+        # while keeping normal transactions spread across
+        # the 90-day observation window.
         # ----------------------------------------------------
 
-        injected_flags = (
-            rng.random(count)
-            < INJECTION_PROB
+        day_offsets = np.sort(
+            rng.choice(
+                np.arange(
+                    0,
+                    90,
+                ),
+                size=count,
+                replace=False,
+            )
         )
 
+        timestamps = []
+
+        for day_offset in day_offsets:
+
+            # Normal transactions concentrate around the
+            # customer's usual hour.
+            hour = int(
+                np.clip(
+                    round(
+                        rng.normal(
+                            usual_hour,
+                            2.0,
+                        )
+                    ),
+                    7,
+                    23,
+                )
+            )
+
+            minute = int(
+                rng.integers(
+                    0,
+                    60,
+                )
+            )
+
+            second = int(
+                rng.integers(
+                    0,
+                    60,
+                )
+            )
+
+            timestamp = (
+                START_DATE
+                + pd.Timedelta(
+                    days=int(
+                        day_offset
+                    ),
+                    hours=hour,
+                    minutes=minute,
+                    seconds=second,
+                )
+            )
+
+            timestamps.append(
+                timestamp
+            )
+
         # ----------------------------------------------------
-        # Build chronological timestamps for this customer.
+        # Create actual suspicious bursts.
         #
-        # Injected events often happen shortly after an earlier
-        # event, creating REAL velocity rather than adding fake
-        # velocity counts.
+        # A scenario start creates 4-5 transactions close
+        # together. Velocity will therefore be calculated
+        # from actual previous events.
         # ----------------------------------------------------
 
-        offsets_hours = np.zeros(
+        pattern_flags = np.zeros(
             count,
-            dtype=float,
+            dtype=bool,
         )
 
-        for index in range(
-            1,
+        scenario_start_flags = np.zeros(
             count,
+            dtype=bool,
+        )
+
+        index = 1
+
+        while (
+            index < count
         ):
 
             if (
-                injected_flags[index]
-                and rng.random() < 0.80
+                rng.random()
+                < INJECTION_PROB
+                and index + 3 < count
+                and not pattern_flags[
+                    max(
+                        0,
+                        index - 3,
+                    ):index
+                ].any()
             ):
-                gap_hours = (
-                    rng.uniform(
-                        10,
-                        50,
-                    ) / 60.0
-                )
-            else:
-                gap_hours = float(
-                    np.clip(
-                        rng.exponential(
-                            11.0 * 24.0
-                        ),
-                        1.0,
-                        25.0 * 24.0,
+
+                scenario_start_flags[
+                    index
+                ] = True
+
+                # Burst length: 4 or 5 events.
+                burst_length = int(
+                    rng.integers(
+                        4,
+                        6,
                     )
                 )
 
-            offsets_hours[index] = (
-                offsets_hours[index - 1]
-                + gap_hours
-            )
+                burst_length = min(
+                    burst_length,
+                    count - index,
+                )
 
-        # Keep the complete customer stream inside
-        # the requested 90-day observation window.
-        max_span_hours = (
-            END_DATE
-            - START_DATE
-        ).total_seconds() / 3600.0
+                burst_indices = range(
+                    index,
+                    index
+                    + burst_length,
+                )
 
-        total_span = offsets_hours[-1]
+                for burst_index in (
+                    burst_indices
+                ):
+                    pattern_flags[
+                        burst_index
+                    ] = True
 
-        if total_span > max_span_hours:
-            scale = (
-                max_span_hours
-                / total_span
-            )
+                # Put the burst on the current event's day.
+                burst_date = (
+                    timestamps[index]
+                    .normalize()
+                )
 
-            offsets_hours *= scale
+                # 80% of suspicious scenarios occur
+                # during an unusual hour.
+                if (
+                    rng.random()
+                    < 0.80
+                ):
+                    burst_hour = int(
+                        rng.choice(
+                            [
+                                0,
+                                1,
+                                2,
+                                3,
+                                4,
+                                5,
+                                23,
+                            ]
+                        )
+                    )
+                else:
+                    burst_hour = int(
+                        np.clip(
+                            rng.normal(
+                                usual_hour,
+                                2.0,
+                            ),
+                            7,
+                            23,
+                        )
+                    )
 
-        first_offset_hours = float(
-            rng.uniform(
-                0,
-                24,
-            )
-        )
+                burst_start = (
+                    burst_date
+                    + pd.Timedelta(
+                        hours=burst_hour,
+                        minutes=int(
+                            rng.integers(
+                                0,
+                                45,
+                            )
+                        ),
+                        seconds=int(
+                            rng.integers(
+                                0,
+                                60,
+                            )
+                        ),
+                    )
+                )
 
-        timestamps = [
-            START_DATE
-            + pd.Timedelta(
-                hours=first_offset_hours
-                + float(offset),
-            )
-            for offset in offsets_hours
-        ]
+                timestamps[index] = (
+                    burst_start
+                )
+
+                # Keep each burst transaction within
+                # approximately one hour.
+                current_time = (
+                    burst_start
+                )
+
+                for burst_index in range(
+                    index + 1,
+                    index
+                    + burst_length,
+                ):
+
+                    current_time = (
+                        current_time
+                        + pd.Timedelta(
+                            minutes=int(
+                                rng.integers(
+                                    8,
+                                    18,
+                                )
+                            )
+                        )
+                    )
+
+                    timestamps[
+                        burst_index
+                    ] = current_time
+
+                index += (
+                    burst_length
+                )
+
+            else:
+
+                index += 1
 
         # ----------------------------------------------------
-        # Customer history
+        # Customer state/history
         # ----------------------------------------------------
 
         known_recipients = set(
@@ -421,23 +629,31 @@ def generate(
         ] = deque()
 
         # ----------------------------------------------------
-        # Generate each transaction
+        # Process events chronologically
         # ----------------------------------------------------
 
-        for index in range(
+        for event_index in range(
             count
         ):
 
             timestamp = timestamps[
-                index
+                event_index
             ]
 
-            injected = bool(
-                injected_flags[index]
+            scenario_start = bool(
+                scenario_start_flags[
+                    event_index
+                ]
+            )
+
+            in_pattern = bool(
+                pattern_flags[
+                    event_index
+                ]
             )
 
             # ------------------------------------------------
-            # Remove old history.
+            # Remove historical events outside windows.
             # ------------------------------------------------
 
             while (
@@ -461,7 +677,7 @@ def generate(
                 amount_history.popleft()
 
             # ------------------------------------------------
-            # Actual customer 30-day average.
+            # Historical 30-day average
             # ------------------------------------------------
 
             if amount_history:
@@ -481,7 +697,7 @@ def generate(
                 avg_amount_30d = base_amount
 
             # ------------------------------------------------
-            # Transaction timing
+            # Current hour
             # ------------------------------------------------
 
             hour = int(
@@ -492,9 +708,34 @@ def generate(
             # Recipient
             # ------------------------------------------------
 
+            if scenario_start:
+
+                # Strong suspicious scenario:
+                # high probability of new recipient.
+                use_new_recipient = (
+                    rng.random()
+                    < 0.78
+                )
+
+            elif in_pattern:
+
+                # Burst followers still have a higher
+                # chance of recipient novelty, but less
+                # aggressively than the scenario start.
+                use_new_recipient = (
+                    rng.random()
+                    < 0.30
+                )
+
+            else:
+
+                use_new_recipient = (
+                    rng.random()
+                    >= 0.88
+                )
+
             if (
-                injected
-                and rng.random() < 0.75
+                use_new_recipient
             ):
 
                 recipient_num = int(
@@ -504,10 +745,15 @@ def generate(
                     )
                 )
 
+                # Ensure genuinely new for this customer.
+                attempts = 0
+
                 while (
                     recipient_num
                     in known_recipients
+                    and attempts < 20
                 ):
+
                     recipient_num = int(
                         rng.integers(
                             1,
@@ -515,10 +761,9 @@ def generate(
                         )
                     )
 
-            elif (
-                known_recipients
-                and rng.random() < 0.88
-            ):
+                    attempts += 1
+
+            else:
 
                 recipient_num = int(
                     rng.choice(
@@ -528,42 +773,49 @@ def generate(
                     )
                 )
 
-            else:
-
-                recipient_num = int(
-                    rng.integers(
-                        1,
-                        N_RECIPIENTS + 1,
-                    )
-                )
-
             recipient_new = int(
                 recipient_num
                 not in known_recipients
             )
 
             # ------------------------------------------------
-            # Device and location
+            # Device/location changes
             # ------------------------------------------------
 
-            if injected:
+            if scenario_start:
 
                 device_changed = int(
-                    rng.random() < 0.78
+                    rng.random()
+                    < 0.78
                 )
 
                 location_changed = int(
-                    rng.random() < 0.72
+                    rng.random()
+                    < 0.72
+                )
+
+            elif in_pattern:
+
+                device_changed = int(
+                    rng.random()
+                    < 0.30
+                )
+
+                location_changed = int(
+                    rng.random()
+                    < 0.28
                 )
 
             else:
 
                 device_changed = int(
-                    rng.random() < 0.025
+                    rng.random()
+                    < 0.025
                 )
 
                 location_changed = int(
-                    rng.random() < 0.035
+                    rng.random()
+                    < 0.035
                 )
 
             device_num = (
@@ -592,7 +844,7 @@ def generate(
             # Amount
             # ------------------------------------------------
 
-            if injected:
+            if scenario_start:
 
                 multiplier = float(
                     rng.uniform(
@@ -605,11 +857,31 @@ def generate(
                     avg_amount_30d
                     * multiplier
                     * rng.lognormal(
-                        0,
+                        0.0,
                         0.12,
                     ),
                     500,
                     50000,
+                )
+
+            elif in_pattern:
+
+                multiplier = float(
+                    rng.uniform(
+                        1.5,
+                        4.0,
+                    )
+                )
+
+                amount = clip(
+                    avg_amount_30d
+                    * multiplier
+                    * rng.lognormal(
+                        0.0,
+                        0.20,
+                    ),
+                    50,
+                    25000,
                 )
 
             else:
@@ -617,7 +889,7 @@ def generate(
                 amount = clip(
                     avg_amount_30d
                     * rng.lognormal(
-                        0,
+                        0.0,
                         0.42,
                     ),
                     20,
@@ -625,36 +897,9 @@ def generate(
                 )
 
             # ------------------------------------------------
-            # Inject unusual time for suspicious patterns.
-            # ------------------------------------------------
-
-            if (
-                injected
-                and rng.random() < 0.80
-            ):
-
-                unusual_hours = [
-                    0,
-                    1,
-                    2,
-                    3,
-                    4,
-                    5,
-                    23,
-                ]
-
-                hour = int(
-                    rng.choice(
-                        unusual_hours
-                    )
-                )
-
-                timestamp = timestamp.replace(
-                    hour=hour
-                )
-
-            # ------------------------------------------------
-            # Actual transaction velocity
+            # Actual historical velocity.
+            #
+            # No artificial count is added here.
             # ------------------------------------------------
 
             transactions_last_24h = len(
@@ -673,7 +918,7 @@ def generate(
             )
 
             # ------------------------------------------------
-            # Derived behavioural features
+            # Behavioral features
             # ------------------------------------------------
 
             amount_ratio = (
@@ -693,10 +938,11 @@ def generate(
 
             unusual_hour = int(
                 hour < 6
+                or hour > 22
             )
 
-            behavioral_deviation = (
-                build_behavioral_deviation(
+            behavioral_score = (
+                behavioral_deviation_score(
                     amount_ratio,
                     hour_distance,
                     device_changed,
@@ -705,125 +951,15 @@ def generate(
                 )
             )
 
-            high_amount = int(
-                amount_ratio >= 3.0
-            )
-
-            high_velocity = int(
-                transactions_last_1h >= 3
-            )
-
             # ------------------------------------------------
-            # OBSERVABLE synthetic risk-generating process
+            # Store transaction row.
             #
-            # IMPORTANT:
-            # No "injected" flag appears here.
-            #
-            # Nonlinear interactions are intentional because
-            # they give the ML model meaningful interactions
-            # beyond simple signal counting.
-            # ------------------------------------------------
-
-            interaction_score = (
-                1.10
-                * recipient_new
-                * device_changed
-                + 0.90
-                * high_amount
-                * device_changed
-                + 0.80
-                * high_amount
-                * high_velocity
-                + 0.70
-                * recipient_new
-                * unusual_hour
-                + 0.55
-                * device_changed
-                * location_changed
-            )
-
-            risk_logit = (
-                -5.1
-                + 1.20
-                * recipient_new
-                + 1.55
-                * device_changed
-                + 1.25
-                * location_changed
-                + 0.32
-                * min(
-                    transactions_last_1h,
-                    8,
-                )
-                + 0.08
-                * min(
-                    transactions_last_24h,
-                    24,
-                )
-                + 1.45
-                * unusual_hour
-                + 1.15
-                * np.log1p(
-                    min(
-                        amount_ratio,
-                        20,
-                    )
-                )
-                + 1.25
-                * behavioral_deviation
-                + 0.55
-                * high_amount
-                + 0.50
-                * high_velocity
-                + interaction_score
-                - 0.00012
-                * account_age_days
-            )
-
-            probability = sigmoid(
-                risk_logit
-            )
-
-            # ------------------------------------------------
-            # Probabilistic label.
-            #
-            # No deterministic "injected -> suspicious"
-            # override is used.
-            # ------------------------------------------------
-
-            is_suspicious = int(
-                rng.random()
-                < probability
-            )
-
-            # ------------------------------------------------
-            # Persist current event into history.
-            # ------------------------------------------------
-
-            prior_events.append(
-                timestamp
-            )
-
-            amount_history.append(
-                (
-                    timestamp,
-                    amount,
-                )
-            )
-
-            known_recipients.add(
-                recipient_num
-            )
-
-            # ------------------------------------------------
-            # Store row
+            # Label is calculated later for all rows.
             # ------------------------------------------------
 
             rows.append(
                 {
-                    "transaction_id": (
-                        f"TX{len(rows) + 1:06d}"
-                    ),
+                    "transaction_id": "",
                     "customer_id": (
                         f"C{customer_num:05d}"
                     ),
@@ -877,30 +1013,46 @@ def generate(
                         hour_distance
                     ),
                     "behavioral_deviation_score": round(
-                        behavioral_deviation,
+                        behavioral_score,
                         4,
-                    ),
-                    "is_suspicious": (
-                        is_suspicious
                     ),
                 }
             )
 
+            # ------------------------------------------------
+            # Persist current event after features are built.
+            # ------------------------------------------------
+
+            prior_events.append(
+                timestamp
+            )
+
+            amount_history.append(
+                (
+                    timestamp,
+                    amount,
+                )
+            )
+
+            known_recipients.add(
+                recipient_num
+            )
+
     # ========================================================
-    # Final dataframe
+    # DataFrame
     # ========================================================
 
     df = pd.DataFrame(
         rows
     )
 
-    # --------------------------------------------------------
-    # Sort globally by timestamp.
-    # --------------------------------------------------------
-
     df["timestamp"] = pd.to_datetime(
         df["timestamp"]
     )
+
+    # --------------------------------------------------------
+    # Global chronological order
+    # --------------------------------------------------------
 
     df = (
         df.sort_values(
@@ -911,6 +1063,21 @@ def generate(
         )
     )
 
+    # --------------------------------------------------------
+    # Sequential transaction IDs after final ordering.
+    # --------------------------------------------------------
+
+    df["transaction_id"] = [
+        f"TX{index + 1:06d}"
+        for index in range(
+            len(df)
+        )
+    ]
+
+    # --------------------------------------------------------
+    # Make sure timestamp string format is consistent.
+    # --------------------------------------------------------
+
     df["timestamp"] = (
         df["timestamp"]
         .dt.strftime(
@@ -918,9 +1085,207 @@ def generate(
         )
     )
 
+    # ========================================================
+    # Observable synthetic risk-generating process
+    # ========================================================
+    #
+    # IMPORTANT:
+    # There is NO reference to scenario_start_flags,
+    # pattern_flags, or any hidden injection variable here.
+    #
+    # The label depends only on observable transaction
+    # and behavioral signals.
+    # ========================================================
+
+    amount_ratio = df[
+        "amount_ratio"
+    ].to_numpy(
+        dtype=float
+    )
+
+    recipient_new = df[
+        "recipient_new"
+    ].to_numpy(
+        dtype=float
+    )
+
+    device_changed = df[
+        "device_changed"
+    ].to_numpy(
+        dtype=float
+    )
+
+    location_changed = df[
+        "location_changed"
+    ].to_numpy(
+        dtype=float
+    )
+
+    tx_1h = df[
+        "transactions_last_1h"
+    ].to_numpy(
+        dtype=float
+    )
+
+    tx_24h = df[
+        "transactions_last_24h"
+    ].to_numpy(
+        dtype=float
+    )
+
+    unusual_hour = (
+        (
+            df["hour"].to_numpy()
+            < 6
+        )
+        |
+        (
+            df["hour"].to_numpy()
+            > 22
+        )
+    ).astype(float)
+
+    behavioral_score = df[
+        "behavioral_deviation_score"
+    ].to_numpy(
+        dtype=float
+    )
+
+    account_age = df[
+        "account_age_days"
+    ].to_numpy(
+        dtype=float
+    )
+
     # --------------------------------------------------------
+    # Observable threshold features
+    # --------------------------------------------------------
+
+    high_amount = (
+        amount_ratio >= 3.0
+    ).astype(float)
+
+    high_velocity = (
+        tx_1h >= 3
+    ).astype(float)
+
+    # --------------------------------------------------------
+    # Nonlinear interactions.
+    #
+    # These are observable combinations that a learned model
+    # can represent more flexibly than a simple signal count.
+    # --------------------------------------------------------
+
+    interaction_score = (
+        1.35
+        * recipient_new
+        * device_changed
+
+        + 1.05
+        * high_amount
+        * device_changed
+
+        + 0.95
+        * high_amount
+        * high_velocity
+
+        + 0.85
+        * recipient_new
+        * unusual_hour
+
+        + 0.70
+        * device_changed
+        * location_changed
+
+        + 0.60
+        * high_velocity
+        * unusual_hour
+    )
+
+    raw_logits = (
+        -5.5
+
+        + 1.20
+        * recipient_new
+
+        + 1.55
+        * device_changed
+
+        + 1.25
+        * location_changed
+
+        + 0.34
+        * np.minimum(
+            tx_1h,
+            8,
+        )
+
+        + 0.08
+        * np.minimum(
+            tx_24h,
+            24,
+        )
+
+        + 1.55
+        * unusual_hour
+
+        + 1.20
+        * np.log1p(
+            np.minimum(
+                amount_ratio,
+                20,
+            )
+        )
+
+        + 1.20
+        * behavioral_score
+
+        + 0.50
+        * high_amount
+
+        + 0.45
+        * high_velocity
+
+        + interaction_score
+
+        - 0.00012
+        * account_age
+    )
+
+    # --------------------------------------------------------
+    # Calibrate synthetic prevalence.
+    # --------------------------------------------------------
+
+    intercept_adjustment = (
+        calibrate_intercept(
+            raw_logits,
+            TARGET_SUSPICIOUS_RATE,
+        )
+    )
+
+    probabilities = sigmoid(
+        raw_logits
+        + intercept_adjustment
+    )
+
+    # --------------------------------------------------------
+    # Probabilistic noisy label.
+    #
+    # No deterministic suspicious override is used.
+    # --------------------------------------------------------
+
+    labels = (
+        rng.random(
+            len(df)
+        )
+        < probabilities
+    ).astype(int)
+
+    df["is_suspicious"] = labels
+
+    # ========================================================
     # Save
-    # --------------------------------------------------------
+    # ========================================================
 
     OUT.parent.mkdir(
         parents=True,
@@ -933,7 +1298,7 @@ def generate(
     )
 
     # ========================================================
-    # Reporting
+    # REPORTING
     # ========================================================
 
     print(
@@ -965,6 +1330,22 @@ def generate(
     )
 
     print(
+        "\nTarget suspicious rate:"
+    )
+
+    print(
+        f"{TARGET_SUSPICIOUS_RATE:.4f}"
+    )
+
+    print(
+        "\nMean generated probability:"
+    )
+
+    print(
+        f"{probabilities.mean():.4f}"
+    )
+
+    print(
         "\nDataset shape:"
     )
 
@@ -972,62 +1353,89 @@ def generate(
         df.shape
     )
 
+    # --------------------------------------------------------
+    # Signal prevalence
+    # --------------------------------------------------------
+
     print(
         "\nSignal prevalence:"
+    )
+
+    normal = (
+        df["is_suspicious"]
+        == 0
+    )
+
+    suspicious = (
+        df["is_suspicious"]
+        == 1
     )
 
     signal_summary = pd.DataFrame(
         {
             "Normal": [
                 df.loc[
-                    df["is_suspicious"] == 0,
+                    normal,
                     "recipient_new",
                 ].mean(),
+
                 df.loc[
-                    df["is_suspicious"] == 0,
+                    normal,
                     "device_changed",
                 ].mean(),
+
                 df.loc[
-                    df["is_suspicious"] == 0,
+                    normal,
                     "location_changed",
                 ].mean(),
+
                 (
                     df.loc[
-                        df["is_suspicious"] == 0,
+                        normal,
                         "amount_ratio",
-                    ] >= 3
+                    ]
+                    >= 3.0
                 ).mean(),
+
                 (
                     df.loc[
-                        df["is_suspicious"] == 0,
+                        normal,
                         "hour",
-                    ] < 6
+                    ]
+                    < 6
                 ).mean(),
             ],
+
             "Suspicious": [
                 df.loc[
-                    df["is_suspicious"] == 1,
+                    suspicious,
                     "recipient_new",
                 ].mean(),
+
                 df.loc[
-                    df["is_suspicious"] == 1,
+                    suspicious,
                     "device_changed",
                 ].mean(),
+
                 df.loc[
-                    df["is_suspicious"] == 1,
+                    suspicious,
                     "location_changed",
                 ].mean(),
+
                 (
                     df.loc[
-                        df["is_suspicious"] == 1,
+                        suspicious,
                         "amount_ratio",
-                    ] >= 3
+                    ]
+                    >= 3.0
                 ).mean(),
+
                 (
                     df.loc[
-                        df["is_suspicious"] == 1,
+                        suspicious,
                         "hour",
-                    ] < 6
+                    ]
+                    < 6
                 ).mean(),
             ],
         },
@@ -1044,12 +1452,77 @@ def generate(
         signal_summary.round(4)
     )
 
+    # --------------------------------------------------------
+    # Velocity statistics
+    # --------------------------------------------------------
+
+    print(
+        "\nVelocity statistics:"
+    )
+
+    print(
+        "transactions_last_1h max:",
+        df[
+            "transactions_last_1h"
+        ].max(),
+    )
+
+    print(
+        "transactions_last_24h max:",
+        df[
+            "transactions_last_24h"
+        ].max(),
+    )
+
+    print(
+        "transactions_last_1h >= 3:",
+        (
+            df[
+                "transactions_last_1h"
+            ] >= 3
+        ).mean(),
+    )
+
+    # --------------------------------------------------------
+    # Hour statistics
+    # --------------------------------------------------------
+
+    print(
+        "\nHour statistics:"
+    )
+
+    print(
+        "Normal before 06:00:",
+        (
+            df.loc[
+                normal,
+                "hour",
+            ]
+            < 6
+        ).mean(),
+    )
+
+    print(
+        "Suspicious before 06:00:",
+        (
+            df.loc[
+                suspicious,
+                "hour",
+            ]
+            < 6
+        ).mean(),
+    )
+
+    # --------------------------------------------------------
+    # Sample
+    # --------------------------------------------------------
+
     print(
         "\nSample:"
     )
 
     print(
-        df.head(5)
+        df.head(10)
         .to_string(
             index=False
         )
