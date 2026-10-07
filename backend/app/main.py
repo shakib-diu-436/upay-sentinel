@@ -5,6 +5,13 @@ import numpy as np
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
+from .database import (
+    database_health,
+    get_case,
+    get_recent_cases,
+    init_db,
+    save_analysis,
+)
 from .schemas import (
     InvestigationResponse,
     RiskResponse,
@@ -47,6 +54,14 @@ app.add_middleware(
 
 
 # ============================================================
+# DATABASE INITIALIZATION
+# ============================================================
+
+# Create SQLite database and tables when the API module loads.
+init_db()
+
+
+# ============================================================
 # SERVICES
 # ============================================================
 
@@ -65,7 +80,7 @@ def prepare_transaction_data(
     Convert the validated API request into the feature
     dictionary required by the trained Sentinel models.
 
-    Raw API fields are used to derive the behavioral features
+    Raw API fields are used to derive the behavioural features
     required by the trained XGBoost and Isolation Forest models.
     """
 
@@ -84,7 +99,7 @@ def prepare_transaction_data(
     )
 
     # --------------------------------------------------------
-    # Distance from customer's usual transaction hour
+    # Distance from usual transaction hour
     # --------------------------------------------------------
 
     hour_difference = abs(
@@ -111,7 +126,8 @@ def prepare_transaction_data(
                 )
                 + 0.20
                 * min(
-                    data["hour_distance_from_usual"] / 8.0,
+                    data["hour_distance_from_usual"]
+                    / 8.0,
                     2.0,
                 )
                 + 0.15
@@ -127,24 +143,15 @@ def prepare_transaction_data(
     )
 
     # ========================================================
-    # ENHANCED FEATURES
-    # These must match the features used by ml/train.py
+    # ENHANCED XGBOOST FEATURES
     # ========================================================
 
-    # --------------------------------------------------------
-    # 1. Unusual transaction hour
-    # --------------------------------------------------------
-    # Training logic:
-    # unusual_hour = (hour < 6).astype(int)
-
+    # Unusual hour: before 06:00
     data["unusual_hour"] = int(
         data["hour"] < 6
     )
 
-    # --------------------------------------------------------
-    # 2. Log amount ratio
-    # --------------------------------------------------------
-
+    # Log-transformed amount ratio
     data["log_amount_ratio"] = float(
         np.log1p(
             max(
@@ -154,26 +161,17 @@ def prepare_transaction_data(
         )
     )
 
-    # --------------------------------------------------------
-    # 3. High amount flag
-    # --------------------------------------------------------
-
+    # Amount is at least 3x customer's average
     data["high_amount_flag"] = int(
         data["amount_ratio"] >= 3.0
     )
 
-    # --------------------------------------------------------
-    # 4. High velocity flag
-    # --------------------------------------------------------
-
+    # High transaction velocity
     data["high_velocity_flag"] = int(
         data["transactions_last_1h"] >= 3
     )
 
-    # --------------------------------------------------------
-    # 5. Risk signal count
-    # --------------------------------------------------------
-
+    # Count of risk signals
     data["risk_signal_count"] = int(
         data["recipient_new"]
         + data["device_changed"]
@@ -197,6 +195,7 @@ def root() -> dict:
         "status": "running",
         "service": "AI Risk Intelligence API",
         "version": "0.2.0",
+        "database": "sqlite",
     }
 
 
@@ -210,6 +209,26 @@ def health() -> dict:
         "status": "healthy",
         "service": "upay-sentinel",
     }
+
+
+# ============================================================
+# DATABASE HEALTH
+# ============================================================
+
+@app.get("/api/v1/database/health")
+def database_status() -> dict:
+    """
+    Return basic SQLite database statistics.
+    """
+
+    try:
+        return database_health()
+
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail="Database health check failed.",
+        ) from exc
 
 
 # ============================================================
@@ -239,6 +258,15 @@ def analyze_transaction(
 
         result = risk_service.analyze(
             data
+        )
+
+        # ----------------------------------------------------
+        # Persist transaction + risk assessment
+        # ----------------------------------------------------
+
+        save_analysis(
+            transaction=data,
+            analysis=result,
         )
 
         return result
@@ -288,10 +316,80 @@ def investigate_transaction(
             analysis=analysis,
         )
 
+        # ----------------------------------------------------
+        # Persist complete investigation
+        # ----------------------------------------------------
+
+        save_analysis(
+            transaction=data,
+            analysis=analysis,
+            case=case,
+        )
+
         return case
 
     except Exception as exc:
         raise HTTPException(
             status_code=500,
             detail=str(exc),
+        ) from exc
+
+
+# ============================================================
+# RECENT INVESTIGATION CASES
+# ============================================================
+
+@app.get("/api/v1/cases")
+def recent_cases(
+    limit: int = 20,
+) -> dict:
+    """
+    Return the most recently created investigation cases.
+    """
+
+    try:
+        return {
+            "count": len(
+                get_recent_cases(limit)
+            ),
+            "cases": get_recent_cases(limit),
+        }
+
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail="Could not load investigation cases.",
+        ) from exc
+
+
+# ============================================================
+# SINGLE INVESTIGATION CASE
+# ============================================================
+
+@app.get("/api/v1/cases/{case_id}")
+def single_case(
+    case_id: int,
+) -> dict:
+    """
+    Return one persisted investigation case.
+    """
+
+    try:
+        case = get_case(case_id)
+
+        if case is None:
+            raise HTTPException(
+                status_code=404,
+                detail="Investigation case not found.",
+            )
+
+        return case
+
+    except HTTPException:
+        raise
+
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail="Could not load investigation case.",
         ) from exc

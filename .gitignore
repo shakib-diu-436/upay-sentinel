@@ -6,3 +6,6 @@ __pycache__/
 artifacts/
 data/processed/*.csv
 *.log
+data/app/*.db
+data/app/*.sqlite
+data/app/*.sqlite3
