@@ -1,7 +1,10 @@
-import { useMemo, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 
 const API_URL =
   'http://127.0.0.1:8000/api/v1/investigation/analyze'
+
+const CASES_URL =
+  'http://127.0.0.1:8000/api/v1/cases?limit=10'
 
 // ============================================================
 // LOW-RISK EXAMPLE
