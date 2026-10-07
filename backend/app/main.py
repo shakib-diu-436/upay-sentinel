@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import numpy as np
+
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -63,8 +65,8 @@ def prepare_transaction_data(
     Convert the validated API request into the feature
     dictionary required by the trained Sentinel models.
 
-    The trained models require some derived features that
-    are calculated from the raw request values.
+    Raw API fields are used to derive the behavioral features
+    required by the trained XGBoost and Isolation Forest models.
     """
 
     data = transaction.model_dump()
@@ -100,8 +102,7 @@ def prepare_transaction_data(
     # --------------------------------------------------------
 
     data["behavioral_deviation_score"] = float(
-        min(
-            1.0,
+        np.clip(
             (
                 0.40
                 * min(
@@ -110,8 +111,7 @@ def prepare_transaction_data(
                 )
                 + 0.20
                 * min(
-                    data["hour_distance_from_usual"]
-                    / 8.0,
+                    data["hour_distance_from_usual"] / 8.0,
                     2.0,
                 )
                 + 0.15
@@ -121,7 +121,66 @@ def prepare_transaction_data(
                 + 0.10
                 * data["recipient_new"]
             ),
+            0.0,
+            1.0,
         )
+    )
+
+    # ========================================================
+    # ENHANCED FEATURES
+    # These must match the features used by ml/train.py
+    # ========================================================
+
+    # --------------------------------------------------------
+    # 1. Unusual transaction hour
+    # --------------------------------------------------------
+    # Training logic:
+    # unusual_hour = (hour < 6).astype(int)
+
+    data["unusual_hour"] = int(
+        data["hour"] < 6
+    )
+
+    # --------------------------------------------------------
+    # 2. Log amount ratio
+    # --------------------------------------------------------
+
+    data["log_amount_ratio"] = float(
+        np.log1p(
+            max(
+                data["amount_ratio"],
+                0.0,
+            )
+        )
+    )
+
+    # --------------------------------------------------------
+    # 3. High amount flag
+    # --------------------------------------------------------
+
+    data["high_amount_flag"] = int(
+        data["amount_ratio"] >= 3.0
+    )
+
+    # --------------------------------------------------------
+    # 4. High velocity flag
+    # --------------------------------------------------------
+
+    data["high_velocity_flag"] = int(
+        data["transactions_last_1h"] >= 3
+    )
+
+    # --------------------------------------------------------
+    # 5. Risk signal count
+    # --------------------------------------------------------
+
+    data["risk_signal_count"] = int(
+        data["recipient_new"]
+        + data["device_changed"]
+        + data["location_changed"]
+        + data["high_amount_flag"]
+        + data["high_velocity_flag"]
+        + data["unusual_hour"]
     )
 
     return data
@@ -166,12 +225,18 @@ def analyze_transaction(
 ) -> RiskResponse:
 
     try:
-        # Prepare model features.
+        # ----------------------------------------------------
+        # Prepare model features
+        # ----------------------------------------------------
+
         data = prepare_transaction_data(
             transaction
         )
 
-        # Run Sentinel risk pipeline.
+        # ----------------------------------------------------
+        # Run Sentinel risk pipeline
+        # ----------------------------------------------------
+
         result = risk_service.analyze(
             data
         )
@@ -198,7 +263,10 @@ def investigate_transaction(
 ) -> InvestigationResponse:
 
     try:
-        # Prepare model features.
+        # ----------------------------------------------------
+        # Prepare model features
+        # ----------------------------------------------------
+
         data = prepare_transaction_data(
             transaction
         )

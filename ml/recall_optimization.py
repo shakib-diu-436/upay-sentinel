@@ -400,6 +400,7 @@ def main() -> None:
                 float_format=lambda x:
                     f"{x:.4f}",
             )
+        )
 
     # --------------------------------------------------------
     # Select operating threshold
