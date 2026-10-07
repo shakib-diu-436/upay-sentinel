@@ -39,13 +39,19 @@ class RiskService:
             min(100.0, anomaly_score),
         ) / 100.0
 
+        # -----------------------------------------------------
         # Base contribution
+        # -----------------------------------------------------
+
         base_risk = (
             0.70 * transaction
             + 0.30 * anomaly
         )
 
+        # -----------------------------------------------------
         # Multi-signal corroboration
+        # -----------------------------------------------------
+
         corroboration_bonus = (
             0.15
             * transaction
@@ -67,7 +73,7 @@ class RiskService:
         final_score: float,
     ) -> str:
         """
-        Risk levels:
+        Final Sentinel risk levels:
 
         0-44.99   -> LOW RISK
         45-69.99  -> REVIEW
@@ -110,6 +116,19 @@ class RiskService:
     ) -> dict:
         """
         Run all Sentinel intelligence layers.
+
+        Flow:
+            XGBoost transaction risk
+                ↓
+            Model threshold decision
+                ↓
+            Isolation Forest anomaly
+                ↓
+            Risk fusion
+                ↓
+            Sentinel risk classification
+                ↓
+            SHAP explanation
         """
 
         # -----------------------------------------------------
@@ -120,6 +139,31 @@ class RiskService:
             self.models.predict_transaction_risk(
                 data
             )
+        )
+
+        # -----------------------------------------------------
+        # XGBoost model-level classification
+        # -----------------------------------------------------
+        #
+        # transaction_risk is returned as probability * 100.
+        # Convert it back to 0-1 before comparing it with
+        # the stored model threshold.
+        #
+        # Example:
+        # threshold = 0.7346
+        # probability = 0.80
+        # 0.80 >= 0.7346
+        # => SUSPICIOUS
+        #
+
+        model_probability = (
+            transaction_risk / 100.0
+        )
+
+        model_decision = (
+            "SUSPICIOUS"
+            if model_probability >= self.models.threshold
+            else "NORMAL"
         )
 
         # -----------------------------------------------------
@@ -144,7 +188,7 @@ class RiskService:
         )
 
         # -----------------------------------------------------
-        # Risk Classification
+        # Final Sentinel Risk Classification
         # -----------------------------------------------------
 
         risk_level = self.classify(
@@ -167,6 +211,10 @@ class RiskService:
             data
         )
 
+        # -----------------------------------------------------
+        # API Response
+        # -----------------------------------------------------
+
         return {
             "transaction_risk": round(
                 transaction_risk,
@@ -187,10 +235,15 @@ class RiskService:
 
             "recommended_action": action,
 
+            # Stored threshold from the trained model.
             "model_threshold": round(
                 self.models.threshold * 100,
                 2,
             ),
+
+            # XGBoost-only classification.
+            # Separate from final Sentinel risk level.
+            "model_decision": model_decision,
 
             "reasons": reasons,
         }

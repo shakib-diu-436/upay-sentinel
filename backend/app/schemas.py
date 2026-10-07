@@ -81,6 +81,10 @@ class RiskResponse(BaseModel):
 
     model_threshold: float
 
+    # XGBoost model-level decision.
+    # This is separate from the final Sentinel risk level.
+    model_decision: str
+
     reasons: list[RiskReason]
 
 
